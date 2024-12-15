@@ -1,0 +1,10 @@
+[package]
+name = "ubi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rquickjs = "*"
+smol = "*"
+lazy_static = "*"
+clap = "*"
