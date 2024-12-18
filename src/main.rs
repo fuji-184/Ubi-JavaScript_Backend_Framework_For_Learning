@@ -1,12 +1,19 @@
-use rquickjs::{Runtime, Context, Function, Value, Error};
+use rquickjs::{Runtime, Context, Function, Value};
 use smol::{net::TcpListener, lock::Mutex, io, io::{AsyncReadExt, AsyncWriteExt}};
 use std::collections::HashMap;
 use std::sync::Arc;
+use lazy_static::lazy_static;
 use clap::{Command, Arg};
 
 #[derive(Debug, Clone)]
+pub struct RouteData {
+    pub content_type: String,
+    pub response: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Routes {
-    routes: HashMap<String, String>
+    routes: HashMap<String, RouteData>,
 }
 
 impl Routes {
@@ -16,13 +23,26 @@ impl Routes {
         }
     }
 
-    pub async fn add_route(&mut self, path: String, response: String) {
-        self.routes.insert(path, response);
+    pub async fn add_route(&mut self, path: String, content_type: String, response: String) {
+        self.routes.insert(
+            path,
+            RouteData {
+                content_type,
+                response,
+            },
+        );
     }
 
-    pub async fn get_response(&self, path: &str) -> String {
-        self.routes.get(path).cloned().unwrap_or_else(|| "404 Not Found".to_string())
+    pub async fn get_response<'a>(&'a self, path: &str) -> &'a RouteData {
+        self.routes.get(path).unwrap_or(&DEFAULT_ROUTE)
     }
+}
+
+lazy_static! {
+    static ref DEFAULT_ROUTE: RouteData = RouteData {
+        content_type: "text/plain".to_string(),
+        response: "404 Not Found".to_string(),
+    };
 }
 
 pub async fn handle_request(routes: Arc<Mutex<Routes>>, mut stream: smol::net::TcpStream) -> io::Result<()> {
@@ -38,11 +58,12 @@ pub async fn handle_request(routes: Arc<Mutex<Routes>>, mut stream: smol::net::T
 
     let routes_ref = routes.lock().await;
 
-    let response = routes_ref.get_response(path).await;
+    let route_data = routes_ref.get_response(path).await;
     let http_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-        response.len(),
-        response
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+        route_data.content_type,
+        route_data.response.len(),
+        route_data.response
     );
     stream.write_all(http_response.as_bytes()).await?;
     stream.flush().await?;
@@ -61,7 +82,8 @@ pub async fn start_server(routes: Arc<Mutex<Routes>>, port: u16) -> io::Result<(
             if let Err(e) = handle_request(routes_ref, stream).await {
                 eprintln!("Error handling request: {}", e);
             }
-        }).detach();
+        })
+        .detach();
     }
 }
 
@@ -73,12 +95,13 @@ pub async fn create_context(routes: Arc<Mutex<Routes>>) -> (Runtime, Context) {
         let globals = ctx.globals();
 
         let routes_ref = Arc::clone(&routes);
-        let get_fn = Function::new(ctx.clone(), move |path: String, response: String| {
+        let get_fn = Function::new(ctx.clone(), move |path: String, content_type: String, response: String| {
             smol::block_on(async {
                 let mut routes_clone = routes_ref.lock().await;
-                routes_clone.add_route(path, response).await;
+                routes_clone.add_route(path, content_type, response).await;
             });
-        }).unwrap();
+        })
+        .unwrap();
         globals.set("get", get_fn).unwrap();
 
         let listen_fn = Function::new(ctx.clone(), move |port: u16| {
@@ -87,8 +110,10 @@ pub async fn create_context(routes: Arc<Mutex<Routes>>) -> (Runtime, Context) {
                 if let Err(e) = start_server(routes_clone, port).await {
                     eprintln!("Server error: {}", e);
                 }
-            }).detach();
-        }).unwrap();
+            })
+            .detach();
+        })
+        .unwrap();
         globals.set("listen", listen_fn).unwrap();
     });
     (rt, ctx)
@@ -97,12 +122,14 @@ pub async fn create_context(routes: Arc<Mutex<Routes>>) -> (Runtime, Context) {
 fn main() -> io::Result<()> {
     let matches = Command::new("ubi")
         .version("1.0")
-        .author("Fuji fujisantoso134@gmail.com")
+        .author("Fuji <fujisantoso134@gmail.com>")
         .about("Create JavaScript backend easily")
-        .arg(Arg::new("script")
-             .value_name("FILE")
-             .help("The JavaScript file to run")
-             .required(true))
+        .arg(
+            Arg::new("script")
+                .value_name("FILE")
+                .help("The JavaScript file to run")
+                .required(true),
+        )
         .get_matches();
 
     smol::block_on(async {
@@ -111,17 +138,11 @@ fn main() -> io::Result<()> {
 
         let script_default = String::from("main.js");
 
-        let script_path = match matches.get_one::<String>("script") {
-            Some(isi) => isi,
-            None => {
-                eprintln!("{}", String::from("Failed to read command"));
-                &script_default
-            }
-        };
+        let script_path = matches.get_one::<String>("script").unwrap_or(&script_default);
 
         ctx.with(|ctx| {
             match ctx.eval_file::<Value, &str>(script_path) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => eprintln!("Error: {}", e),
             }
         });
