@@ -87,9 +87,8 @@ pub async fn start_server(routes: Arc<Mutex<Routes>>, port: u16) -> io::Result<(
     }
 }
 
-pub async fn create_context(routes: Arc<Mutex<Routes>>) -> (Runtime, Context) {
-    let rt = Runtime::new().unwrap();
-    let ctx = Context::full(&rt).unwrap();
+pub async fn create_context(routes: Arc<Mutex<Routes>>) -> Context {
+    let ctx = Context::full(&Runtime::new().unwrap()).unwrap();
 
     ctx.with(|ctx| {
         let globals = ctx.globals();
@@ -116,7 +115,7 @@ pub async fn create_context(routes: Arc<Mutex<Routes>>) -> (Runtime, Context) {
         .unwrap();
         globals.set("listen", listen_fn).unwrap();
     });
-    (rt, ctx)
+    ctx
 }
 
 fn main() -> io::Result<()> {
@@ -134,7 +133,7 @@ fn main() -> io::Result<()> {
 
     smol::block_on(async {
         let routes = Arc::new(Mutex::new(Routes::new()));
-        let (rt, ctx) = create_context(Arc::clone(&routes)).await;
+        let ctx = create_context(Arc::clone(&routes)).await;
 
         let script_default = String::from("main.js");
 
