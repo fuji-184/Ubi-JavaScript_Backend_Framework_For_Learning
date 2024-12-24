@@ -1,8 +1,9 @@
 use rquickjs::{Runtime, Context, Function, Value};
-use smol::{net::TcpListener, lock::RwLock, io, io::{AsyncReadExt, AsyncWriteExt}};
+use smol::{net::TcpListener, lock::Mutex, io, io::{AsyncReadExt, AsyncWriteExt}};
+use std::collections::HashMap;
 use std::sync::Arc;
+use lazy_static::lazy_static;
 use clap::{Command, Arg};
-use std::collections::{VecDeque, HashMap};
 
 #[derive(Debug, Clone)]
 pub struct RouteData {
@@ -32,58 +33,20 @@ impl Routes {
         );
     }
 
-    pub fn get_response<'a>(&'a self, path: &str) -> &'a RouteData {
+    pub async fn get_response<'a>(&'a self, path: &str) -> &'a RouteData {
         self.routes.get(path).unwrap_or(&DEFAULT_ROUTE)
     }
 }
 
-lazy_static::lazy_static! {
+lazy_static! {
     static ref DEFAULT_ROUTE: RouteData = RouteData {
         content_type: "text/plain".to_string(),
         response: "404 Not Found".to_string(),
     };
 }
 
-pub struct BufferPool {
-    pool: RwLock<VecDeque<Vec<u8>>>,
-    buffer_size: usize,
-    max_buffers: usize
-}
-
-impl BufferPool {
-    pub fn new(buffer_size: usize, max_buffers: usize) -> Self {
-        BufferPool {
-            pool: RwLock::new(VecDeque::new()),
-            buffer_size,
-            max_buffers
-        }
-    }
-
-    pub async fn get(&self) -> Vec<u8> {
-        let mut pool = self.pool.write().await;
-
-        pool.pop_front().unwrap_or_else(|| vec![0; self.buffer_size])
-    }
-
-    pub async fn release(&self, buffer: Vec<u8>) {
-        let mut pool = self.pool.write().await;
-
-        if pool.len() < self.max_buffers {
-            pool.push_back(buffer);
-        }
-    }
-
-    pub async fn add(&self) {
-        let mut pool = self.pool.write().await;
-
-        for _ in 0..self.max_buffers {
-            pool.push_back(vec![0; self.buffer_size]);
-        }
-    }
-}
-
-pub async fn handle_request(routes: Arc<RwLock<Routes>>, mut stream: smol::net::TcpStream, buffer_pool: Arc<BufferPool>) -> io::Result<()> {
-    let mut buffer = buffer_pool.get().await;
+pub async fn handle_request(routes: Arc<Mutex<Routes>>, mut stream: smol::net::TcpStream) -> io::Result<()> {
+    let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer).await?;
 
     let request = String::from_utf8_lossy(&buffer[..n]);
@@ -93,36 +56,30 @@ pub async fn handle_request(routes: Arc<RwLock<Routes>>, mut stream: smol::net::
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
 
-    let routes_ref = routes.read().await;
-    let route_data = routes_ref.get_response(path);
+    let routes_ref = routes.lock().await;
 
-    let mut http_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
+    let route_data = routes_ref.get_response(path).await;
+    let http_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
         route_data.content_type,
-        route_data.response.len()
-    )
-    .into_bytes();
-    http_response.extend_from_slice(route_data.response.as_bytes());
-
-    stream.write_all(&http_response).await?;
+        route_data.response.len(),
+        route_data.response
+    );
+    stream.write_all(http_response.as_bytes()).await?;
     stream.flush().await?;
-
-    buffer_pool.release(buffer).await;
 
     Ok(())
 }
 
-pub async fn start_server(routes: Arc<RwLock<Routes>>, buffer_pool: Arc<BufferPool>, port: u16) -> io::Result<()> {
+pub async fn start_server(routes: Arc<Mutex<Routes>>, port: u16) -> io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     println!("The server is running on port {}", port);
 
     loop {
         let (stream, _) = listener.accept().await?;
         let routes_ref = Arc::clone(&routes);
-        let buffer_pool_ref = Arc::clone(&buffer_pool);
-
         smol::spawn(async move {
-            if let Err(e) = handle_request(routes_ref, stream, buffer_pool_ref).await {
+            if let Err(e) = handle_request(routes_ref, stream).await {
                 eprintln!("Error handling request: {}", e);
             }
         })
@@ -130,7 +87,7 @@ pub async fn start_server(routes: Arc<RwLock<Routes>>, buffer_pool: Arc<BufferPo
     }
 }
 
-pub async fn create_context(routes: Arc<RwLock<Routes>>, buffer_pool: Arc<BufferPool>) -> Context {
+pub async fn create_context(routes: Arc<Mutex<Routes>>) -> Context {
     let ctx = Context::full(&Runtime::new().unwrap()).unwrap();
 
     ctx.with(|ctx| {
@@ -139,7 +96,7 @@ pub async fn create_context(routes: Arc<RwLock<Routes>>, buffer_pool: Arc<Buffer
         let routes_ref = Arc::clone(&routes);
         let get_fn = Function::new(ctx.clone(), move |path: String, content_type: String, response: String| {
             smol::block_on(async {
-                let mut routes_clone = routes_ref.write().await;
+                let mut routes_clone = routes_ref.lock().await;
                 routes_clone.add_route(path, content_type, response).await;
             });
         })
@@ -148,9 +105,8 @@ pub async fn create_context(routes: Arc<RwLock<Routes>>, buffer_pool: Arc<Buffer
 
         let listen_fn = Function::new(ctx.clone(), move |port: u16| {
             let routes_clone = Arc::clone(&routes);
-            let buffer_pool_ref = Arc::clone(&buffer_pool);
             smol::spawn(async move {
-                if let Err(e) = start_server(routes_clone, buffer_pool_ref, port).await {
+                if let Err(e) = start_server(routes_clone, port).await {
                     eprintln!("Server error: {}", e);
                 }
             })
@@ -176,12 +132,8 @@ fn main() -> io::Result<()> {
         .get_matches();
 
     smol::block_on(async {
-        let routes = Arc::new(RwLock::new(Routes::new()));
-
-        let buffer_pool = Arc::new(BufferPool::new(1024, 100));
-        buffer_pool.add().await;
-
-        let ctx = create_context(routes, buffer_pool).await;
+        let routes = Arc::new(Mutex::new(Routes::new()));
+        let ctx = create_context(Arc::clone(&routes)).await;
 
         let script_default = String::from("main.js");
 
