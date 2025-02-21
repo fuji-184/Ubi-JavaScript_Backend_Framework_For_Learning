@@ -1,0 +1,32 @@
+[package]
+name = "project"
+version = "0.1.0"
+edition = "2021"
+
+[build]
+rustflags = ["-L", "libs"]
+
+[build-dependencies]
+cc = "*"
+walkdir = "*"
+regex = "*"
+
+[dependencies]
+lazy_static = "*"
+may = { version = "*", default-features = false }
+may_minihttp = { version = "0.1", default-features = false }
+may_postgres = { git = "https://github.com/Xudong-Huang/may_postgres.git", default-features = false }
+serde = { version = "*", features=["derive"] }
+serde_json = "*"
+include_dir = "*"
+num_cpus = "*"
+rust-embed = { version = "8.5.0", features = ["include-exclude"] }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+panic = 'abort'
+lto = "thin"
+debug = false
+incremental = false
+overflow-checks = false

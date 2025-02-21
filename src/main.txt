@@ -1,0 +1,427 @@
+use rquickjs::{Runtime, Context, Function, Value};
+use smol::{net::TcpListener, lock::RwLock, io, io::{AsyncReadExt, AsyncWriteExt}};
+use std::sync::Arc;
+use clap::{Command, Arg};
+use std::collections::{VecDeque, HashMap};
+use std::fs;
+use std::path::Path;
+// use std::process::Command as StdCommand;
+use smol::channel::{Sender, Receiver};
+
+#[derive(Debug, Clone)]
+pub struct RouteData {
+    pub content_type: String,
+    pub response: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Routes {
+    routes: HashMap<String, RouteData>,
+}
+
+impl Routes {
+    pub fn new() -> Self {
+        Routes {
+            routes: HashMap::new(),
+        }
+    }
+
+    pub async fn add_route(&mut self, path: String, content_type: String, response: String) {
+        self.routes.insert(
+            path,
+            RouteData {
+                content_type,
+                response,
+            },
+        );
+        println!("{:?}", self.routes);
+    }
+
+    pub fn get_response<'a>(&'a self, path: &str) -> &'a RouteData {
+        println!("{:?}", path);
+        self.routes.get(path).unwrap_or(&DEFAULT_ROUTE)
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref DEFAULT_ROUTE: RouteData = RouteData {
+        content_type: "text/plain".to_string(),
+        response: "404 Not Found".to_string(),
+    };
+}
+
+pub struct BufferPool {
+    pool: RwLock<VecDeque<Vec<u8>>>,
+    buffer_size: usize,
+    max_buffers: usize
+}
+
+impl BufferPool {
+    pub fn new(buffer_size: usize, max_buffers: usize) -> Self {
+        BufferPool {
+            pool: RwLock::new(VecDeque::new()),
+            buffer_size,
+            max_buffers
+        }
+    }
+
+    pub async fn get(&self) -> Vec<u8> {
+        let mut pool = self.pool.write().await;
+
+        pool.pop_front().unwrap_or_else(|| vec![0; self.buffer_size])
+    }
+
+    pub async fn release(&self, buffer: Vec<u8>) {
+        let mut pool = self.pool.write().await;
+
+        if pool.len() < self.max_buffers {
+            pool.push_back(buffer);
+        }
+    }
+
+    pub async fn add(&self) {
+        let mut pool = self.pool.write().await;
+
+        for _ in 0..self.max_buffers {
+            pool.push_back(vec![0; self.buffer_size]);
+        }
+    }
+}
+
+pub async fn handle_request(routes: Arc<RwLock<Routes>>, mut stream: smol::net::TcpStream, buffer_pool: Arc<BufferPool>, se: Arc<Sender<RequestData>>) -> io::Result<()> {
+    let mut buffer = buffer_pool.get().await;
+    let n = stream.read(&mut buffer).await?;
+
+    let request = String::from_utf8_lossy(&buffer[..n]);
+    //println!("{}", request);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+
+    /*
+
+    {
+        let request_data = RequestData {
+            request: request.clone().to_string(),
+            //stream: &stream
+        };
+        se.send(request_data).await;
+    }
+
+    */
+
+    let routes_ref = routes.read().await;
+    let route_data = routes_ref.get_response(path);
+
+    let mut http_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
+        route_data.content_type,
+        route_data.response.len()
+    )
+    .into_bytes();
+    http_response.extend_from_slice(route_data.response.as_bytes());
+
+    stream.write_all(&http_response).await?;
+    stream.flush().await?;
+
+    buffer_pool.release(buffer).await;
+
+    Ok(())
+}
+
+pub async fn start_server(routes: Arc<RwLock<Routes>>, buffer_pool: Arc<BufferPool>, port: u16, se: Arc<Sender<RequestData>>) -> io::Result<()> {
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    println!("The server is running on port {}", port);
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let routes_ref = Arc::clone(&routes);
+        let buffer_pool_ref = Arc::clone(&buffer_pool);
+        let se_ref = Arc::clone(&se);
+
+        smol::spawn(async move {
+            if let Err(e) = handle_request(routes_ref, stream, buffer_pool_ref, se_ref).await {
+                eprintln!("Error handling request: {}", e);
+            }
+        })
+        .detach();
+    }
+}
+
+pub async fn create_context(routes: Arc<RwLock<Routes>>) -> (Context, Arc<Sender<RequestData>>, Receiver<RequestData>) {
+
+    let (se, re) = smol::channel::unbounded();
+    let se_arc = Arc::new(se);
+    let se_ref = Arc::clone(&se_arc);
+    //let re_arc = Arc::new(re);
+    //let re_ref = Arc::clone(&re_arc);
+
+    let ctx = Context::full(&Runtime::new().unwrap()).unwrap();
+
+    ctx.with(|ctx| {
+        let globals = ctx.globals();
+
+        let routes_ref = Arc::clone(&routes);
+
+        let get_fn = Function::new(ctx.clone(), move |path: String, content_type: String, response: String| {
+            smol::block_on(async {
+                let mut routes_clone = routes_ref.write().await;
+                routes_clone.add_route(path, content_type, response).await;
+            });
+        })
+        .unwrap();
+        globals.set("get", get_fn).unwrap();
+    });
+
+    (ctx, se_ref, re)
+}
+
+fn main() -> io::Result<()> {
+    let matches = Command::new("ubi")
+        .version("1.0")
+        .author("Fuji <fujisantoso134@gmail.com>")
+        .about("Create JavaScript backend easily")
+        .subcommand(
+            Command::new("build")
+                .about("Build Ubi project")
+        )
+        .arg(
+            Arg::new("script")
+                .value_name("FILE")
+                .help("The JavaScript file to run")
+        )
+        .get_matches();
+
+    smol::block_on(async {
+        let routes = Arc::new(RwLock::new(Routes::new()));
+
+        println!("sedang eksekusi add route");
+
+        let buffer_pool = Arc::new(BufferPool::new(1024, 100));
+        buffer_pool.add().await;
+
+        let (ctx, se, re) = create_context(Arc::clone(&routes)).await;
+
+        //let script_default = String::from("main.ubi");
+
+        if let Some(_) = matches.subcommand_name() {
+            println!("build dieksekusi");
+            build_ubi()?;
+            return Ok(());
+        } else {
+
+        ctx.with(|ctx| {
+            match ctx.eval_file::<Result<Value, rquickjs::Error>, &str>("./main.ubi").unwrap() {
+                Ok(_) => (),
+                Err(e) => eprintln!("error: {:?}", e)
+            }
+        });
+
+        //add_routes3("./client", &ctx, Arc::clone(&routes)).await.unwrap();
+        println!("cek routes: {:?}", routes);
+
+        smol::spawn(async move {
+            if let Err(e) = start_server(Arc::clone(&routes), Arc::clone(&buffer_pool), 8080, se).await {
+                eprintln!("Server error: {}", e);
+            }
+        }).detach();
+
+
+        //engine_worker(re, &ctx).await;
+
+        loop {
+            smol::Timer::after(std::time::Duration::from_secs(60)).await;
+        }
+
+        }
+    })
+}
+
+async fn add_routes3(path: &str, ctx: &Context, routes: Arc<RwLock<Routes>>) -> std::io::Result<()> {
+    let entries = fs::read_dir(path)?;
+    for entry in entries {
+        let path = entry?.path();
+        if path.is_dir() {
+            Box::pin(add_routes3(path.to_str().unwrap(), ctx, Arc::clone(&routes))).await?;
+        }
+
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some(file) => {
+                if file == "server.ubi" {
+                    //let isi = fs::read_to_string(path.to_str().unwrap()).unwrap();
+                    println!("nama: {:?}", path);
+
+                    /*
+                    ctx.with(|ctx| {
+                        match ctx.eval_file::<Value, &str>(path.to_str().unwrap()) {
+                            Ok(_) => {},
+                            Err(e) => eprintln!("Error: {}", e)
+                        }
+                    });
+                    */
+
+                    let url = path.strip_prefix("./client").expect("Failed to strip client path").parent().expect("Failed to get parent path").to_string_lossy().to_string();
+                    routes.write().await.add_route(format!("/{}", url), "application/json".to_string(), "hello".to_string()).await;
+
+                } else if file == "ui.ubi" {
+ //                   println!("{:?}", path);
+                }
+            },
+            None => ()
+        }
+    }
+
+    Ok(())
+}
+
+async fn add_routes2(dir: &Path, routes: Arc<RwLock<Routes>>) -> std::io::Result<()> {
+    //println!("add route 2 dieksekusi");
+    let entries = fs::read_dir(dir)?;
+        for entry in entries {
+            let routes_ref = Arc::clone(&routes);
+            let path = entry?.path();
+            if path.is_dir() {
+                Box::pin(add_routes2(path.as_path(), routes_ref)).await?;
+            } else if let Some(ext) = path.extension().unwrap().to_str() {
+                let relative_path = path.strip_prefix("./hasil").unwrap();
+                let path_str = relative_path.parent().unwrap().to_str().unwrap().to_string().replace("\\", "/");
+                let content_type = match ext {
+                    "html" => "text/html".to_string(),
+                    _ => "application/octet-stream".to_string()
+                };
+                //println!("{:?}", path_str);
+                let content = fs::read_to_string(&path)?;
+                let path_route = format!("/{}", path_str);
+                //println!("{:?}", path_route);
+
+                routes_ref.write().await.add_route(path_route, content_type, content).await;
+                //println!("{:?}", );
+            }
+        }
+    Ok(())
+}
+
+fn build_ubi() -> io::Result<()> {
+    let client_dir = Path::new("./client");
+    if !client_dir.exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Client directory not found"));
+    }
+
+    handle_files(client_dir)?;
+
+    Ok(())
+}
+
+fn handle_files(dir: &Path) -> std::io::Result<()> {
+     let entries = fs::read_dir(dir)?;
+
+    for entry in entries {
+    let path = entry?.path();
+    if path.is_dir() {
+        //println!("{:?}", path);
+        //let path2 = format!("{}.ubi", &path.to_str().unwrap());
+        //println!("{:?}", path2);
+        handle_files(Path::new(&path.to_str().unwrap()))?;
+        //println!("{:?}", path);
+    } else if path.extension().and_then(|ext| ext.to_str()) == Some("ubi") {
+        //let file_name = path.file_stem().and_then(|stem| stem.to_str()).unwrap();
+        let js_path = Path::new("./hasil").join(path.strip_prefix("./client").unwrap().to_str().unwrap().replace(".ubi", ".html"));
+        //println!("{:?}", path);
+        let content = resolve_imports(&path)?;
+        //println!("{:?}", js_path);
+        fs::create_dir_all(js_path.parent().unwrap())?;
+        fs::write(js_path, &content)?;
+        //println!("{:?}", content);
+    }
+
+    }
+    Ok(())
+}
+
+fn resolve_imports(path: &Path) -> std::io::Result<String> {
+    let mut content = fs::read_to_string(path)?;
+    // println!("{:?}", content);
+    //if content.contains("<ubi+") {
+    //println!("contains");
+    let re = regex::Regex::new(r#"<ubi\+\s*"(.*?)">"#).unwrap();
+
+    // Collect all replacements first
+    let mut replacements = Vec::new();
+    for captures in re.captures_iter(&content) {
+        let import_path = captures.get(1).unwrap().as_str();
+        //println!("{:?}", import_path);
+        let import_path_full = path.parent().unwrap().join(import_path);
+        //println!("{:?}", import_path);
+        //let import_content = resolve_imports(&import_path)?;
+        let import_content = fs::read_to_string(&import_path_full)?;
+        //println!("{:?} {:?}", import_path, import_content);
+        replacements.push((
+            format!("<ubi+ \"{}\">", import_path.to_string()),
+            import_content
+        ));
+    }
+
+    // Apply all replacements after the iterator is done
+    for (pattern, replacement) in replacements {
+        content = content.replace(&pattern, &replacement);
+    }
+
+    //}
+
+    //println!("{:?}", content);
+
+    Ok(content)
+}
+
+#[derive(Debug)]
+pub struct RequestData {
+    //stream: &'lifetime1 smol::net::TcpStream,
+    request: String
+}
+
+async fn engine_worker(re: Receiver<RequestData>, ctx: &Context) -> () {
+
+    println!("channel dieksekusi");
+
+    while let Ok(request_data) = re.recv().await {
+        //let request = request_data;
+        //let stream = request_data.stream;
+        //println!("{:?}", request);
+
+        println!("looping di channel");
+
+        let path = request_data.request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/");
+
+        println!("path dari engine worker: {}", path);
+
+        ctx.with(|ctx| {
+            /*
+            let hello = Function::new(ctx.clone(), move || {
+                println!("{:?}", request_data);
+            }).unwrap();
+        ctx.globals().set("hello", hello).unwrap();
+*/
+
+if let Ok(handler) = ctx.globals().get::<_, rquickjs::Function>("tes3") {
+        match handler.call::<_, String>((request_data.request,)) {
+            Ok(result) => println!("Result: {}", result),
+            Err(e) => eprintln!("Error: {}", e)
+        }
+    }
+
+        match ctx.eval_file::<Value, &str>("./client/server.ubi") {
+            Ok(_) => {},
+            Err(e) => eprintln!("Error: {}", e)
+        }
+
+        });
+
+
+    }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "ubi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lazy_static = "*"
+clap = "*"
+regex = "1"
+include_dir = "*"
+uuid = { version = "*", features = ["v4"] }
+gemini-rs = "*"
+tokio = "*"
+serde_json = "*"
+
+# [profile.release]
+# codegen-units = 1
+# lto = "fat"
+# opt-level = 3
+# panic = "abort"

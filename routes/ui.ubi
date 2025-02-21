@@ -1,0 +1,7 @@
+<script>
+let a = "fuji"
+</script>
+
+<if a === "fuji">
+Helloooo
+</if>
