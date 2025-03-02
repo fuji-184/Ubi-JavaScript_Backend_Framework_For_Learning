@@ -33,7 +33,7 @@ type Data = {
 
 function get(): string {
     let hasil: Data = ubi.query("select * from data")
-    return JSON.stringify(hasil)
+    return ubi.json(hasil)
 }
 ```
 
@@ -46,7 +46,7 @@ class Data(TypedDict):
 
 def get() -> str:
     hasil: Data = ubi.query("select * from data")
-    return str(hasil)
+    return ubi.json(hasil)
 
 ```
 
