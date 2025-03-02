@@ -1,4 +1,4 @@
-Documentation : ubi-documentation.vercel.app
+Documentation : [ubi-documentation.vercel.app](https://ubi-documentation.vercel.app)
 
 Ubi is Hybrid Fullstack Web Development Framework. Note this project is still very experimental. Currently only able to serve get request method. More ability will be added
 
