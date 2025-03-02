@@ -5,7 +5,7 @@ use crate::PgConnection;
 
 pub mod tes;
 
-pub type HandlerFn = fn(&PgConnection) -> Result<String, Box<dyn std::error::Error>>;
+pub type HandlerFn = fn(&PgConnection) -> Result<String, may_postgres::Error>;
 
 lazy_static! {
     pub static ref ROUTES: HashMap<&'static str, HandlerFn> = {

@@ -9,9 +9,10 @@ clap = "*"
 regex = "1"
 include_dir = "*"
 uuid = { version = "*", features = ["v4"] }
-gemini-rs = "*"
-tokio = "*"
 serde_json = "*"
+walkdir = "*"
+postgres-types = "0.2.9"
+# compact_str = { version = "*", features = ["serde", "smallvec"] }
 
 # [profile.release]
 # codegen-units = 1

@@ -6,21 +6,19 @@ edition = "2021"
 [build]
 rustflags = ["-L", "libs"]
 
-[build-dependencies]
-cc = "*"
-walkdir = "*"
-regex = "*"
-
 [dependencies]
 lazy_static = "*"
 may = { version = "*", default-features = false }
-may_minihttp = { version = "0.1", default-features = false }
+may_minihttp = { git = "https://github.com/fuji-184/may_minihttp.git", default-features = false }
 may_postgres = { git = "https://github.com/Xudong-Huang/may_postgres.git", default-features = false }
 serde = { version = "*", features=["derive"] }
 serde_json = "*"
 include_dir = "*"
 num_cpus = "*"
 rust-embed = { version = "8.5.0", features = ["include-exclude"] }
+postgres-types = "0.2.9"
+compact_str = { version = "*" }
+regex = "*"
 
 [profile.release]
 opt-level = 3

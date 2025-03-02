@@ -20,14 +20,16 @@ use lazy_static::lazy_static;
 
 use ::std::{
     collections::HashMap,
-    fs, io,
-    path::Path
+    fs, io, io::BufRead,
+    path::Path,
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use rust_embed::RustEmbed;
+use compact_str::{ToCompactString, format_compact, CompactString};
+use regex::Regex;
 
 #[derive(RustEmbed)]
 #[folder = "build/"]
@@ -91,12 +93,41 @@ impl PgConnection {
         PgConnection { client }
     }
 
-    fn query(self: &Self, stmt: &str) -> Result<may_postgres::RowStream, may_postgres::Error> {
+    fn query(self: &Self, stmt: &str) -> Result<Vec<serde_json::Value>, may_postgres::Error> {
         let prepare = self.client.prepare(stmt)?;
         //let _ = self.client.execute("prepare tes_stmt as select * from tes;", &[]).unwrap();
-        let mut query = self.client.query_raw(&prepare, &[])?;
+        let query = self.client.query_raw(&prepare, &[])?;
 
-        Ok(query)
+        let hasil: Vec<serde_json::Value> = query.map(|r| {
+                        let r = r.unwrap();
+                        let mut obj = serde_json::Map::new();
+                        for (i, col) in r.columns().iter().enumerate() {
+                let col_name = col.name().to_string();
+                let col_type = col.type_();
+
+                let col_value: serde_json::Value = if col_type == &postgres_types::Type::INT4 || col_type == &postgres_types::Type::INT8 {
+                        r.get::<_, Option<i64>>(i)
+                                .map(|v| serde_json::Value::Number(serde_json::Number::from(v)))
+                                .unwrap_or(serde_json::Value::Null)
+                        } else if col_type == &postgres_types::Type::FLOAT4 || col_type == &postgres_types::Type::FLOAT8 {
+                        r.get::<_, Option<f64>>(i)
+                                .map(|v| serde_json::Value::Number(serde_json::Number::from_f64(v).unwrap()))
+                                .unwrap_or(serde_json::Value::Null)
+                        } else if col_type == &postgres_types::Type::BOOL {
+                        r.get::<_, Option<bool>>(i).map(serde_json::Value::Bool).unwrap_or(serde_json::Value::Null)
+                        } else {
+                        r.get::<_, Option<&str>>(i)
+                                .map(|v| serde_json::Value::String(v.to_string()))
+                                .unwrap_or(serde_json::Value::Null)
+                        };
+
+                obj.insert(col_name, col_value);
+            }
+                        serde_json::Value::Object(obj)
+                        })
+                    .collect();
+
+        Ok(hasil)
     }
 }
 
@@ -124,25 +155,102 @@ impl PgPool {
     }
 }
 
+
 impl HttpService for Context {
     fn call(&mut self, req: Request, res: &mut Response) -> io::Result<()> {
         match req.path() {
             path if path.starts_with("/api") => {
-                let isi = match server::ROUTES.get(path.strip_suffix("/").unwrap_or(path)) {
-                    Some(handler) => {
-                        match handler(&self.db) {
-                            Ok(response) =>response,
-                            Err(e) => format!("Error: {}", e),
-                        }
-                    }
-                    None => format!("404 Not Found: {}", path),
-                };
+                let mut isi = String::new();
+
+                match req.method() {
+                    "GET" => {
+                        isi = match server::ROUTES.get(format_compact!("{}/get", path.strip_suffix("/").unwrap_or(path)).as_str()) {
+                                                Some(handler) => {
+                                                match handler(&self.db, req) {
+                                                        Ok(response) =>response,
+                                                        Err(e) => format!("Error: {}", e),
+                                                    }
+                                            }
+                                                None => {
+                                                    let url = format!("{}/{}", path.strip_suffix("/").unwrap_or(path), req.method().to_lowercase());
+
+                                                    match match_url(&url) {
+                                                        Some((handler, params)) => handler(&self.db, req, &params).unwrap(),
+                                                        None =>  format!("404 Not Found"),
+                                                    }
+                                                }
+                                            };
+
+                    },
+                    "POST" => {
+                        isi = match server::ROUTES.get(format_compact!("{}/post", path.strip_suffix("/").unwrap_or(path)).as_str()) {
+                                        Some(handler) => {
+                                                match handler(&self.db, req) {
+                                                Ok(response) => response,
+                                                Err(e) => format!("Error: {}", e),
+                                            }
+                                            }
+                                        None => {
+                                            let url = format!("{}/{}", path.strip_suffix("/").unwrap_or(path), req.method().to_lowercase());
+
+                                                    match match_url(&url) {
+                                                        Some((handler, params)) => handler(&self.db, req, &params).unwrap(),
+                                                        None =>  format!("404 Not Found"),
+                                                    }
+
+                                        },
+                                    };
+
+                    },
+                    "UPDATE" => {
+                        isi = match server::ROUTES.get(format_compact!("{}/update", path.strip_suffix("/").unwrap_or(path)).as_str()) {
+                                                Some(handler) => {
+                                                match handler(&self.db, req) {
+                                                        Ok(response) =>response,
+                                                        Err(e) => format!("Error: {}", e),
+                                                    }
+                                            }
+                                                None => {
+                                                    let url = format!("{}/{}", path.strip_suffix("/").unwrap_or(path), req.method().to_lowercase());
+
+                                                    match match_url(&url) {
+                                                        Some((handler, params)) => handler(&self.db, req, &params).unwrap(),
+                                                        None =>  format!("404 Not Found"),
+                                                    }
+
+                                                },
+                                            };
+
+                    },
+                    "DELETE" => {
+                        isi = match server::ROUTES.get(format_compact!("{}/delete", path.strip_suffix("/").unwrap_or(path)).as_str()) {
+                        Some(handler) => {
+                                match handler(&self.db, req) {
+                                        Ok(response) =>response,
+                                        Err(e) => format!("Error: {}", e),
+                                    }
+                            }
+                            None => {
+                                let url = format!("{}/{}", path.strip_suffix("/").unwrap_or(path), req.method().to_lowercase());
+
+                                                    match match_url(&url) {
+                                                        Some((handler, params)) => handler(&self.db, req, &params).unwrap(),
+                                                        None =>  format!("404 Not Found"),
+                                                    }
+
+                            },
+                        };
+
+                    },
+                    _ => isi = "not found".to_string()
+                }
 
                 res.header("content-type: application/json").body_vec(isi.into_bytes());
             }
             path if path.starts_with("/parts") => {
                 if !req.path().ends_with("/") {
-                    match Frontend::get(&format!("{}/ui.ubi", req.path().strip_prefix("/parts/").unwrap())) {
+                    // println!("path 1: {}", req.path().strip_prefix("/parts/").unwrap());
+                    match Frontend::get(&format_compact!("{}/ui.js", req.path().strip_prefix("/parts/").unwrap())) {
                         Some(isi) => {
                             res.header("content-type: text/plain").body_vec(isi.data.to_vec());
                         }
@@ -151,13 +259,15 @@ impl HttpService for Context {
                         }
                     };
                 } else {
-                    let path = req.path().strip_prefix("/parts/").unwrap();
-                    let part = Frontend::get(&format!("{}ui.ubi", path)).unwrap();
+                    let mut path = req.path().strip_prefix("/parts/").unwrap();
+                    path = path.strip_prefix("/").unwrap_or(path);
+                    // println!("path sebelum: {}, path 2: {}", req.path(), path);
+                    let part = Frontend::get(&format_compact!("{}ui.js", path)).unwrap();
                     res.header("content-type: text/plain").body_vec(part.data.to_vec());
                 }
             }
             "/favicon.ico" => {
-                match fs::read(format!("./static/{}", req.path())) {
+                match fs::read(format_compact!("./static/{}", req.path())) {
                     Ok(contents) => {
                         res.header(get_mime_type(req.path().to_string()))
                             .body_vec(contents);
@@ -172,7 +282,7 @@ impl HttpService for Context {
             }
             path if path.starts_with("/static") => {
                 let path = req.path();
-                match fs::read(format!(".{}", path)) {
+                match fs::read(format_compact!(".{}", path)) {
                     Ok(contents) => {
                         res.header(get_mime_type(path.to_string()))
                             .body_vec(contents);
@@ -187,7 +297,7 @@ impl HttpService for Context {
             }
             _ => {
                 if !req.path().ends_with("/") {
-                    match Frontend::get(&format!("{}/index.html", req.path().strip_prefix("/").unwrap())) {
+                    match Frontend::get(&format_compact!("{}/index.html", req.path().strip_prefix("/").unwrap())) {
                         Some(isi) => {
                             res.header("content-type: text/html").body_vec(isi.data.to_vec());
                         }
@@ -197,7 +307,7 @@ impl HttpService for Context {
                     };
                 } else {
                     let path = req.path().strip_prefix("/").unwrap();
-                    let index = Frontend::get(&format!("{}index.html", path)).unwrap();
+                    let index = Frontend::get(&format_compact!("{}index.html", path)).unwrap();
                     res.header("content-type: text/html").body_vec(index.data.to_vec());
                 }
             }
@@ -231,6 +341,36 @@ fn get_mime_type(path: String) -> &'static str {
         .unwrap_or(&"content_type: application/octet-stream")
 }
 
+
+pub fn parameterized_url(pattern: &str, url: &str) -> Option<std::collections::HashMap<String, String>> {
+    let re_str = Regex::new(r":([^/]+)").unwrap();
+    let regex_pattern = re_str.replace_all(pattern, r"([^/]+)");
+    let full_regex = format!("^{}$", regex_pattern);
+    let re = Regex::new(&full_regex).unwrap();
+
+    let captures = re.captures(url)?;
+
+    let mut params = std::collections::HashMap::new();
+    for (i, cap) in re_str.captures_iter(pattern).enumerate() {
+        if let Some(param) = cap.get(1) {
+            params.insert(param.as_str().to_string(), captures[i + 1].to_string());
+        }
+    }
+
+    Some(params)
+}
+
+fn match_url(url: &str) -> Option<(server::HandlerFn2, HashMap<String, String>)> {
+    for (pattern, handler) in server::PARAMETERIZED_ROUTES.iter() {
+        if let Some(params) = parameterized_url(pattern, url) {
+            return Some((*handler, params));
+        }
+        println!("pattern : {}", pattern);
+        println!("url : {}", url);
+    }
+    println!("failed to loop parameterized loop");
+    None
+}
 
 fn main() -> io::Result<()> {
 
