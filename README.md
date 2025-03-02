@@ -1,6 +1,8 @@
+Documentation : ubi-documentation.vercel.app
+
 Ubi is Hybrid Fullstack Web Development Framework. Note this project is still very experimental. Currently only able to serve get request method. More ability will be added
 
-To try it, download the release file or build yourself then add to your path (currently only support linux).
+To try it, download the release file or build yourself then add to your path (currently only support linux) then run `ubi setup` to setup Ubi development environtment.
 
 How to start an Ubi project?
 
